@@ -2,29 +2,28 @@
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UI;
-using UnityEngine.Audio;
 
 public class LineManager : MonoBehaviour
 {
     public static LineManager Instance { get; private set; }   // 싱글톤
 
     [Header("UI References")]
-    public Text nameText;            // 캐릭터 이름 UI
-    public Text lineText;            // 대사 출력
-    public GameObject linePanel;     // 대화 패널 (전체 UI)
-    private Image[] slide;           // 슬라이드 이미지들
+    [SerializeField] private Text nameText;        // 캐릭터 이름 UI
+    [SerializeField] private Text lineText;        // 대사 출력
+    [SerializeField] private GameObject linePanel; // 대화 패널 (전체 UI)
+    private Image[] slide;                         // 패널 안의 슬라이드 이미지들
 
     [Header("Settings")]
-    public float typingSpeed = 0.05f;   // 타이핑 속도
+    [SerializeField] private float typingSpeed = 0.05f;   // 타이핑 속도
 
     [Header("Audio")]
-    public AudioSource audioSource;     // 음성 재생용
+    [SerializeField] private AudioSource audioSource;     // 음성 재생용
 
     // ScriptableObject용 대사 큐
-    private Queue<Line> lineQueue = new Queue<Line>();
+    private readonly Queue<Line> lineQueue = new Queue<Line>();
 
-    // NPC 대사 큐
-    private Queue<Line> npcLineQueue = new Queue<Line>();
+    // NPC/플레이어 대사 큐
+    private readonly Queue<Line> npcLineQueue = new Queue<Line>();
 
     private Coroutine typingCoroutine;
     private bool isTyping = false;
@@ -32,12 +31,13 @@ public class LineManager : MonoBehaviour
     // 현재 출력 중인 전체 문장(타이핑 스킵용)
     private string currentFullText = "";
 
-    // ---- GateConversationManager에서 상태 확인용 프로퍼티 ----
+    // GateConversationManager 등 외부에서 상태 확인용
     public bool IsTyping => isTyping;
     public bool HasQueuedLines => lineQueue.Count > 0 || npcLineQueue.Count > 0;
 
     private void Awake()
     {
+        // 싱글톤 설정
         if (Instance == null)
         {
             Instance = this;
@@ -46,20 +46,19 @@ public class LineManager : MonoBehaviour
         else
         {
             Destroy(gameObject);
+            return;
         }
-    }
 
-    // =============================================================
-    // 초기 설정
-    // =============================================================
-    void Start()
-    {
+        // 패널 안의 슬라이드 이미지 캐싱
         if (linePanel != null)
         {
             slide = linePanel.GetComponentsInChildren<Image>(true);
             linePanel.SetActive(false);
         }
     }
+
+
+
 
     // =============================================================
     // ScriptableObject 기반 대화 시작
@@ -69,27 +68,26 @@ public class LineManager : MonoBehaviour
         if (lineSO == null || lineSO.dialogueLines == null || lineSO.dialogueLines.Length == 0)
             return;
 
-        lineQueue.Clear();
-        npcLineQueue.Clear();
+        ClearAllQueues();
 
         foreach (var l in lineSO.dialogueLines)
+        {
             lineQueue.Enqueue(l);
+        }
 
-        linePanel.SetActive(true);
-        StartCoroutine(FadeInSlides(0.6f));
-
-        ShowNextLine();   // 첫 줄은 자동으로 출력
+        OpenPanelIfNeeded(0.6f);
+        ShowNextLine();   // 첫 줄은 자동으로 출력 (외부에서 Space로 다음 줄 제어)
     }
 
     // =============================================================
-    // NPC가 직접 텍스트를 표시할 때 사용
+    // NPC 대사 출력
     // =============================================================
     public void ShowNPCLine(string characterName, Color nameColor, string text, AudioClip clip = null)
     {
         if (string.IsNullOrEmpty(text))
             return;
 
-        Line temp = new Line
+        Line line = new Line
         {
             characterName = characterName,
             line = text,
@@ -97,20 +95,53 @@ public class LineManager : MonoBehaviour
             nameColor = nameColor
         };
 
-        npcLineQueue.Enqueue(temp);
+        EnqueueToNpcQueue(line, 0.3f);
+    }
 
-        // 패널이 꺼져 있으면 켜고 페이드 인
-        if (!linePanel.activeSelf)
+    // =============================================================
+    // 플레이어 대사 출력
+    // =============================================================
+    public void ShowPlayerLine(string playerName, Color nameColor, string text)
+    {
+        if (string.IsNullOrEmpty(text))
+            return;
+
+        Line line = new Line
         {
-            linePanel.SetActive(true);
-            StartCoroutine(FadeInSlides(0.3f));
-        }
+            characterName = playerName,
+            line = text,
+            audioClip = null,   // 플레이어는 기본적으로 음성 없음
+            nameColor = nameColor
+        };
+
+        EnqueueToNpcQueue(line, 0.3f);
+    }
+
+    // NPC/플레이어 공용 큐 로직
+    private void EnqueueToNpcQueue(Line line, float fadeDuration)
+    {
+        npcLineQueue.Enqueue(line);
+
+        OpenPanelIfNeeded(fadeDuration);
 
         // 현재 아무 것도 출력 중이 아니고, ScriptableObject 큐도 비어있다면
-        // 이번에 들어온 NPC 대사를 바로 보여줌
+        // 이번에 들어온 대사를 바로 출력
         if (!isTyping && lineQueue.Count == 0 && npcLineQueue.Count == 1)
         {
             ShowNextLine();
+        }
+    }
+
+    // 패널이 꺼져 있으면 켜고 페이드 인
+    private void OpenPanelIfNeeded(float fadeDuration)
+    {
+        if (linePanel == null)
+            return;
+
+        if (!linePanel.activeSelf)
+        {
+            linePanel.SetActive(true);
+            StartCoroutine(FadeInSlides(fadeDuration));
         }
     }
 
@@ -133,7 +164,7 @@ public class LineManager : MonoBehaviour
         {
             nextLine = lineQueue.Dequeue();
         }
-        // 2순위: NPC 대사
+        // 2순위: NPC/플레이어 대사
         else if (npcLineQueue.Count > 0)
         {
             nextLine = npcLineQueue.Dequeue();
@@ -153,51 +184,21 @@ public class LineManager : MonoBehaviour
     }
 
     // =============================================================
-    // 플레이어 대사 표시용 함수
-    // =============================================================
-    public void ShowPlayerLine(string playerName, Color nameColor, string text)
-    {
-        if (string.IsNullOrEmpty(text))
-            return;
-
-        Line temp = new Line
-        {
-            characterName = playerName,
-            line = text,
-            audioClip = null,      // 플레이어는 보통 음성 없음
-            nameColor = nameColor
-        };
-
-        // 대사를 NPC 큐와 동일한 방식으로 처리
-        npcLineQueue.Enqueue(temp);
-
-        if (!linePanel.activeSelf)
-        {
-            linePanel.SetActive(true);
-            StartCoroutine(FadeInSlides(0.3f));
-        }
-
-        // 지금 아무도 말하고 있지 않고(타이핑 X), SO 대사도 없다면 즉시 출력
-        if (!isTyping && lineQueue.Count == 0 && npcLineQueue.Count == 1)
-        {
-            ShowNextLine();
-        }
-    }
-
-
-    // =============================================================
     // 타이핑 코루틴
     // =============================================================
-    IEnumerator TypeLine(Line line)
+    private IEnumerator TypeLine(Line line)
     {
         isTyping = true;
 
         // 캐릭터 이름 UI 적용
-        nameText.text = line.characterName;
-        nameText.color = line.nameColor;
+        if (nameText != null)
+        {
+            nameText.text = line.characterName;
+            nameText.color = line.nameColor;
+        }
 
         // 오디오 재생
-        if (audioSource && line.audioClip)
+        if (audioSource != null && line.audioClip != null)
         {
             audioSource.Stop();
             audioSource.clip = line.audioClip;
@@ -205,11 +206,14 @@ public class LineManager : MonoBehaviour
         }
 
         currentFullText = line.line;
-        lineText.text = "";
+        if (lineText != null)
+            lineText.text = "";
 
         foreach (char c in currentFullText)
         {
-            lineText.text += c;
+            if (lineText != null)
+                lineText.text += c;
+
             yield return new WaitForSeconds(typingSpeed);
         }
 
@@ -228,8 +232,9 @@ public class LineManager : MonoBehaviour
             typingCoroutine = null;
         }
 
-        // 남은 글자 한 번에 출력
-        lineText.text = currentFullText;
+        if (lineText != null)
+            lineText.text = currentFullText;
+
         isTyping = false;
     }
 
@@ -238,31 +243,37 @@ public class LineManager : MonoBehaviour
     // =============================================================
     private void EndDialogue()
     {
-        StartCoroutine(FadeOutSlides(0.5f));
-        linePanel.SetActive(false);
+        // 패널을 완전히 닫는 것은 ScriptableObject 기반 대화나
+        // 큐가 완전히 비었을 때만 발생
+        if (linePanel != null)
+        {
+            StartCoroutine(FadeOutSlides(0.5f));
+            linePanel.SetActive(false);
+        }
 
-        lineQueue.Clear();
-        npcLineQueue.Clear();
+        ClearAllQueues();
         currentFullText = "";
         isTyping = false;
         typingCoroutine = null;
     }
 
-    // =============================================================
-    // ⚠️ 키 입력 처리는 이제 여기서 하지 않음
-    //    → GateConversationManager가 Space를 처리
-    // =============================================================
+    private void ClearAllQueues()
+    {
+        lineQueue.Clear();
+        npcLineQueue.Clear();
+    }
 
     // =============================================================
-    // 슬라이드 Fade 기능 (기존 코드 그대로)
+    // 슬라이드 Fade 기능
     // =============================================================
     public IEnumerator FadeInSlides(float duration)
     {
-        if (slide == null || slide.Length == 0) yield break;
+        if (slide == null || slide.Length == 0)
+            yield break;
 
         foreach (var img in slide)
         {
-            if (!img) continue;
+            if (img == null) continue;
 
             Color c = img.color;
             c.a = 0f;
@@ -279,7 +290,7 @@ public class LineManager : MonoBehaviour
 
             foreach (var img in slide)
             {
-                if (!img) continue;
+                if (img == null) continue;
 
                 Color c = img.color;
                 c.a = Mathf.Lerp(0f, 1f, t);
@@ -292,7 +303,8 @@ public class LineManager : MonoBehaviour
 
     public IEnumerator FadeOutSlides(float duration)
     {
-        if (slide == null || slide.Length == 0) yield break;
+        if (slide == null || slide.Length == 0)
+            yield break;
 
         float time = 0f;
 
@@ -303,7 +315,7 @@ public class LineManager : MonoBehaviour
 
             foreach (var img in slide)
             {
-                if (!img) continue;
+                if (img == null) continue;
 
                 Color c = img.color;
                 c.a = Mathf.Lerp(1f, 0f, t);
@@ -314,6 +326,9 @@ public class LineManager : MonoBehaviour
         }
 
         foreach (var img in slide)
-            img?.gameObject.SetActive(false);
+        {
+            if (img != null)
+                img.gameObject.SetActive(false);
+        }
     }
 }

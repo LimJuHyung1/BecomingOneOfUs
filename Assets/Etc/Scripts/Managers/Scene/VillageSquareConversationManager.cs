@@ -1,3 +1,4 @@
+using System.Collections;
 using UnityEngine;
 using UnityEngine.UI;
 
@@ -7,8 +8,12 @@ public class VillageSquareConversationManager : ConversationManagerBase
     public NPC elder;   // 촌장
     public NPC ivy;     // 여관 주인 아이비
 
+    // 이 씬에서만 쓰는 임시 호감도 점수
+    private int elderScore = 0;
+    private int ivyScore = 0;
+
     /// <summary>
-    /// Elder1 → Ivy1 → Elder2 → WaitPlayer1 → Ivy2 → Elder3 → Ivy3 → WaitPlayer2 → Elder4 → Ivy4 → Done
+    /// Elder1 → Ivy1 → Elder2 → WaitPlayer1 → Elder3 → Ivy2 → Elder4 → Ivy3 → WaitPlayer2 → Ivy4 → Elder5 → Ivy5 → Done
     /// </summary>
     private enum Step
     {
@@ -17,12 +22,14 @@ public class VillageSquareConversationManager : ConversationManagerBase
         Ivy1,
         Elder2,
         WaitPlayer1,
-        Ivy2,
         Elder3,
+        Ivy2,
+        Elder4,
         Ivy3,
         WaitPlayer2,
-        Elder4,
         Ivy4,
+        Elder5,
+        Ivy5,
         Done
     }
 
@@ -30,7 +37,7 @@ public class VillageSquareConversationManager : ConversationManagerBase
 
     protected override string LogTag => "VillageSquare";
 
-    private void Start()
+    void Start()
     {
         if (elder != null) elder.OnReplied += OnNPCReplied;
         if (ivy != null) ivy.OnReplied += OnNPCReplied;
@@ -38,8 +45,19 @@ public class VillageSquareConversationManager : ConversationManagerBase
         if (elder != null) elder.acceptPlayerInput = false;
         if (ivy != null) ivy.acceptPlayerInput = false;
 
+        // 씬 시작 시: 검은 화면 → 페이드 아웃 → 그 뒤 대화 시작
+        StartCoroutine(SceneStartRoutine());
+    }
+
+    private IEnumerator SceneStartRoutine()
+    {
+        // 검은 스크린에서 점점 투명하게 (Fade From Black)
+        yield return FadeFromBlack();   // ConversationManagerBase에서 제공
+
+        // 페이드가 완전히 끝난 뒤에만 대사 시작
         StartConversation();
     }
+
 
     private void OnDestroy()
     {
@@ -56,9 +74,8 @@ public class VillageSquareConversationManager : ConversationManagerBase
 
         StartNpcTurn(
             elder,
-            "지금은 마을 광장(또는 작은 회관)에서 외지인인 플레이어를 처음 대면한 장면이다. " +
-            "문지기들이 플레이어를 너에게 맡기고 물러난 직후 상황이다. " +
-            "촌장으로서 손님을 맞이해라."
+            "지금은 마을 여관에서 외지인인 플레이어를 처음 대면한 장면이다. " +            
+            "촌장으로서 외지인을 맞이해라."
         );
     }
 
@@ -70,41 +87,60 @@ public class VillageSquareConversationManager : ConversationManagerBase
     // NPC가 말했을 때 서로에게 어떻게 들려줄지
     protected override void OnNpcHeard(NPC npc, NPCResponse res, string speakerName)
     {
+        // 1) 플레이어의 말에 대한 반응일 때만 점수 누적
+        if (speakerName == "Player")
+        {
+            if (npc == elder)
+                elderScore += res.affinity_change;
+            else if (npc == ivy)
+                ivyScore += res.affinity_change;
+        }
+
+        // 2) 기존 로직: 서로에게 들려주기
         if (npc == elder)
         {
-            // 촌장이 말하면 아이비에게 전달
             if (ivy != null) ivy.HearLine("Elder", res.message);
         }
         else if (npc == ivy)
         {
-            // 아이비가 말하면 촌장에게 전달
             if (elder != null) elder.HearLine("Ivy", res.message);
         }
     }
 
+
     // 플레이어가 말했을 때(ConversationManagerBase가 공통 처리 후 여기로 호출)
     protected override void OnPlayerSpoke(string text)
     {
-        // 1차 플레이어 답변 이후: 아이비의 첫인상 턴 대기
+        // 1차 플레이어 답변: Elder가 호감도 타겟이지만, Ivy도 플레이어 말을 듣게 함
         if (currentStep == Step.WaitPlayer1)
         {
-            currentStep = Step.Ivy2;
+            if (ivy != null)
+            {
+                ivy.HearLine("Player", text);
+            }
 
-            SetPendingNpcTurn(
-                ivy,
-                "방금 플레이어가 다음과 같이 말했다: \"" + lastPlayerText + "\" " +
-                "너는 여관 주인 아이비(Ivy)로서 플레이어를 평가해라."
-            );
-        }
-        // 2차 플레이어 답변 이후: 촌장의 최종 결정 턴 대기
-        else if (currentStep == Step.WaitPlayer2)
-        {
-            currentStep = Step.Elder4;
-
+            // 플레이어 대답 후 → 촌장이 그 대답에 대한 반응을 하는 턴
+            currentStep = Step.Elder3;
             SetPendingNpcTurn(
                 elder,
-                "플레이어가 다음과 같이 말했다: \"" + lastPlayerText + "\" " +
-                "이 사람을 며칠 동안 이 마을에 임시로 머무르게 할지에 대한 최종 결정을 알려주는 한 문장을 말해라. "
+                "방금 외지인이 이렇게 대답했다: \"" + lastPlayerText + "\" " +
+                "외지인에 대해 평가해라."
+            );
+        }
+        // 2차 플레이어 답변: Ivy가 호감도 타겟이지만, Elder도 듣게 함
+        else if (currentStep == Step.WaitPlayer2)
+        {
+            if (elder != null)
+            {
+                elder.HearLine("Player", text);
+            }
+
+            // 플레이어 대답 후 → 아이비가 그 대답에 대한 반응을 하는 턴
+            currentStep = Step.Ivy4;
+            SetPendingNpcTurn(
+                ivy,
+                "방금 외지인이 이렇게 대답했다: \"" + lastPlayerText + "\" " +
+                "외지인의 대답을 평가해라."
             );
         }
     }
@@ -119,8 +155,7 @@ public class VillageSquareConversationManager : ConversationManagerBase
                 currentStep = Step.Ivy1;
                 StartNpcTurn(
                     ivy,
-                    "지금은 너가 운영하는 여관에서 촌장이 외지인인 플레이어를 맞이한 직후 상황이다. " +
-                    "너는 이 마을 여관을 운영하는 아이비(Ivy)로서 말해라."
+                    "촌장의 말에 맞장구를 치고 너의 소개를 해라."
                 );
                 break;
 
@@ -129,8 +164,7 @@ public class VillageSquareConversationManager : ConversationManagerBase
                 currentStep = Step.Elder2;
                 StartNpcTurn(
                     elder,
-                    "방금 아이비가 손님에게 인사를 건넸다. " +
-                    "이번 턴에서는 마을에서 무엇을 하려는지 물어보아라."
+                    "아이비의 대답에 이어 외지인의 인성을 파악하는 질문을 해라."
                 );
                 break;
 
@@ -146,21 +180,31 @@ public class VillageSquareConversationManager : ConversationManagerBase
                 waitingForPlayerInput = true;
                 break;
 
-            // Ivy2 → Elder3
-            case Step.Ivy2:
-                currentStep = Step.Elder3;
+            // Elder3 → Ivy2
+            case Step.Elder3:
+                currentStep = Step.Ivy2;
                 StartNpcTurn(
-                    elder,                    
-                    "이번 턴에서는 촌장으로서 이 마을에서 지내게 한다면 무엇을 지켜보겠는지에 대한 생각을 담아 한 문장을 말해라."
+                    ivy,
+                    "엘더의 대답을 평가하고, 외지인에 대한 인상을 말해라."
                 );
                 break;
 
-            // Elder3 → Ivy3
-            case Step.Elder3:
+            // Ivy2 → Elder4
+            case Step.Ivy2:
+                currentStep = Step.Elder4;
+                StartNpcTurn(
+                    elder,
+                    "촌장으로서 외지인이 당분간 이 마을에 머무를 수 있는지에 대해 이야기하고, " +
+                    "여관 주인 아이비에게 이 손님을 맡기겠다는 취지의 말을 건네라. "
+                );
+                break;
+
+            // Elder4 → Ivy3 (아이비가 자기 기준으로 질문하는 턴)
+            case Step.Elder4:
                 currentStep = Step.Ivy3;
                 StartNpcTurn(
                     ivy,                    
-                    "이번 턴에서는 여관 주인 아이비로서, 네 여관에서 지낼 손님에게 지켜줬으면 하는 기본적인 규칙을 알려줘라."
+                    "플레이어에게 궁금한 것이 있는지 물어봐라."
                 );
                 break;
 
@@ -176,18 +220,28 @@ public class VillageSquareConversationManager : ConversationManagerBase
                 waitingForPlayerInput = true;
                 break;
 
-            // Elder4 직전: OnPlayerSpoke에서 pending으로 호출 → Elder4 턴 끝나면 Ivy4
-            case Step.Elder4:
-                currentStep = Step.Ivy4;
+            // Ivy4(플레이어 2차 답변에 대한 아이비 반응) → Elder5
+            case Step.Ivy4:
+                currentStep = Step.Elder5;
                 StartNpcTurn(
-                    ivy,
-                    "촌장이 방금 플레이어에게 이 마을에 임시로 지낼지 안 지낼지 결단을 내렸다. " +
-                    "여관에는 다른 인물도 살고 있다는 점을 언급해라."
+                    elder,
+                    "지금까지의 모든 대화 기록을 참고해서, " +
+                    "촌장으로서 이 사람이 이 마을에 머무를 수 있도록 하여라. "                    
                 );
                 break;
 
-            // Ivy4 → Done
-            case Step.Ivy4:
+            // Elder5 → Ivy5
+            case Step.Elder5:
+                currentStep = Step.Ivy5;
+                StartNpcTurn(
+                    ivy,                    
+                    "여관 주인 아이비로서 외지인에게 방과 여관 생활에 대한 안내를 건네고, " +
+                    "여관에는 다른 손님도 있다는 점을 언급해라."
+                );
+                break;
+
+            // Ivy5 → Done
+            case Step.Ivy5:
                 currentStep = Step.Done;
                 expectedNpc = null;
                 npcReplyReceived = false;
@@ -200,5 +254,17 @@ public class VillageSquareConversationManager : ConversationManagerBase
     {
         Debug.Log("[VillageSquare] 임시 입촌 심사 대화 종료. 다음 씬으로 진행하세요.");
         // TODO: 씬 전환, 플레이어를 여관 방으로 이동 등
+
+        // 대화가 모두 끝난 뒤: 화면을 다시 검게 닫는 연출
+        StartCoroutine(SceneEndRoutine());
+    }
+
+    private IEnumerator SceneEndRoutine()
+    {
+        // 밝은 화면 → 검은 화면으로 페이드
+        yield return FadeToBlack();   // ConversationManagerBase에서 제공
+
+        // 페이드가 끝난 뒤에 씬 전환, 플레이어 이동 등 진행
+        // 예: SceneManager.LoadScene("NextScene");
     }
 }

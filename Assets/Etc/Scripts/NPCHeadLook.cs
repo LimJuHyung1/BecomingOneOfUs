@@ -19,6 +19,16 @@ public class NPCHeadLook : MonoBehaviour
     void Start()
     {
         animator = GetComponent<Animator>();
+
+        // 씬 시작 시부터 이미 플레이어 쪽을 기준으로 보간하도록 초기화
+        if (lookTarget != null)
+        {
+            smoothTargetPos = lookTarget.position;
+        }
+        else
+        {
+            smoothTargetPos = transform.position + transform.forward * 2f;
+        }
     }
 
     private void OnAnimatorIK(int layerIndex)

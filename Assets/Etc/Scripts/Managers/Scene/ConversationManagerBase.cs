@@ -1,11 +1,14 @@
+using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UI;
 
 public abstract class ConversationManagerBase : MonoBehaviour
 {
-    [Header("Player Input")]
+    [Header("UI")]
     public InputField playerInput;
+    public Image screen;      // 전체 화면을 덮는 검은 Image
+    private float fadeDuration = 3f;     // 기본 3초
 
     // 공통 상태
     protected NPC expectedNpc;
@@ -192,6 +195,52 @@ public abstract class ConversationManagerBase : MonoBehaviour
 
         npcReplyReceived = true;
     }
+
+    // ------------------------------------------------------
+    // 공통 페이드 코루틴: 검은 화면에서 밝게 / 밝은 화면에서 검게
+    // ------------------------------------------------------
+    protected IEnumerator FadeFromBlack()
+    {
+        // 검은 화면(알파 1)에서 투명(알파 0)으로
+        if (screen != null && FadeUtility.Instance != null)
+        {
+            screen.gameObject.SetActive(true);
+
+            // 1) screen 페이드 아웃 시작
+            FadeUtility.Instance.FadeOut(screen, fadeDuration);
+
+            // 2) 같은 타이밍에 대사 슬라이드도 페이드 인 시작
+            if (LineManager.Instance != null)
+            {
+                LineManager.Instance.OpenPanelIfNeeded(fadeDuration);
+            }
+
+            // 3) 둘 다 duration 동안 진행
+            yield return new WaitForSeconds(fadeDuration);
+        }
+        else
+        {
+            // 참조가 없으면 한 프레임만 대기
+            yield return null;
+        }
+    }
+
+    protected IEnumerator FadeToBlack()
+    {
+        // 투명(알파 0)에서 검은 화면(알파 1)으로
+        if (screen != null && FadeUtility.Instance != null)
+        {
+            screen.gameObject.SetActive(true);
+            // 초기 알파는 FadeUtility에서 0으로 맞춰줌
+            FadeUtility.Instance.FadeIn(screen, fadeDuration);
+            yield return new WaitForSeconds(fadeDuration);
+        }
+        else
+        {
+            yield return null;
+        }
+    }
+
 
     // 자식 클래스에서 구현해야 하는 부분들
     protected abstract bool IsConversationActive();

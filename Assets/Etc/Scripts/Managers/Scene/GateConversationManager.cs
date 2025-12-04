@@ -1,4 +1,5 @@
-﻿using UnityEngine;
+﻿using System.Collections;
+using UnityEngine;
 using UnityEngine.UI;
 
 public class GateConversationManager : ConversationManagerBase
@@ -14,12 +15,14 @@ public class GateConversationManager : ConversationManagerBase
         Toma1,
         Brown2,
         WaitPlayer1,
-        Toma2,
         Brown3,
+        Toma2,
+        Brown4,
         Toma3,
         WaitPlayer2,
-        Brown4,
         Toma4,
+        Brown5,
+        Toma5,
         Done
     }
 
@@ -37,6 +40,16 @@ public class GateConversationManager : ConversationManagerBase
         if (brown != null) brown.acceptPlayerInput = false;
         if (toma != null) toma.acceptPlayerInput = false;
 
+        // 씬 시작 시: 검은 화면 → 페이드 아웃 → 그 뒤 대화 시작
+        StartCoroutine(SceneStartRoutine());
+    }
+
+    private IEnumerator SceneStartRoutine()
+    {
+        // 검은 스크린에서 점점 투명하게 (Fade From Black)
+        yield return FadeFromBlack();   // ConversationManagerBase에서 제공
+
+        // 페이드가 완전히 끝난 뒤에만 대사 시작
         StartConversation();
     }
 
@@ -52,11 +65,11 @@ public class GateConversationManager : ConversationManagerBase
 
         currentStep = Step.Brown1;
 
-        // Brown1: 플레이어를 처음 보고 시비 거는 느낌
+        // Brown1: 플레이어를 처음 보고 까칠하게 시비 거는 느낌
         StartNpcTurn(
             brown,
-            "지금은 성문 앞에서 외지인인 플레이어를 처음 마주한 상황이다. " +
-            "이번 턴에서는 이 낯선 사람에게 까칠하게 말을 걸며, 왜 여기 왔는지 묻는 짧은 한 문장을 말해라."
+            "지금은 마을 입구 앞에서 외지인인 플레이어를 처음 마주한 상황이다. " +            
+            "이 낯선 사람을 멈춰세워라."
         );
     }
 
@@ -71,40 +84,62 @@ public class GateConversationManager : ConversationManagerBase
     {
         if (npc == brown)
         {
-            // 브라운이 말하면 토마는 듣지만, 브라운은 토마 말을 듣지 않는다.
-            if (toma != null) toma.HearLine("Brown", res.message);
+            // 브라운이 말하면 토마는 항상 듣는다.
+            if (toma != null)
+            {
+                toma.HearLine("Brown", res.message);
+            }
         }
         else if (npc == toma)
         {
-            // 토마가 말한 내용은 브라운에게는 전달하지 않는다.
-            // 필요하다면 여기서 브라운에게도 전달하도록 바꿀 수 있다.
+            // 토마가 말하면 브라운도 듣는다.
+            if (brown != null)
+            {
+                brown.HearLine("Toma", res.message);
+            }
         }
     }
 
     // 플레이어가 한 번 말했을 때, Step에 따라 다음 턴 설정
     protected override void OnPlayerSpoke(string text)
     {
+        // ConversationManagerBase에서 answerTargetNpc 쪽에는 이미 HearLine("Player", ...)가 들어간 상태.
+        // 여기서는 "다른 NPC"에게도 플레이어 발언을 들려준다.
+
         if (currentStep == Step.WaitPlayer1)
         {
-            // 첫 번째 플레이어 대답 이후 → Toma2 턴을 pending으로
-            currentStep = Step.Toma2;
+            // 첫 번째 플레이어 대답은 브라운에게 직접 들어갔으므로,
+            // 토마에게도 플레이어 발언을 들려준다.
+            if (toma != null)
+            {
+                toma.HearLine("Player", text);
+            }
+
+            // 첫 번째 플레이어 대답 이후 → Brown3 턴을 pending으로
+            currentStep = Step.Brown3;
 
             SetPendingNpcTurn(
-                toma,
-                "방금 플레이어가 이렇게 대답했다: \"" + lastPlayerText + "\" " +
-                "너는 브라운 옆에 서 있는 보조 문지기로서, 이 대답을 들은 뒤의 솔직한 인상을 한 문장으로 말해라."
+                brown,
+                "방금 외지인이 이렇게 대답했다: \"" + lastPlayerText + "\" " +
+                "외지인에 대해 평가해라."
             );
         }
         else if (currentStep == Step.WaitPlayer2)
         {
-            // 두 번째 플레이어 대답 이후 → Brown4 턴을 pending으로
-            currentStep = Step.Brown4;
+            // 두 번째 플레이어 대답은 토마에게 직접 들어갔으므로,
+            // 브라운에게도 플레이어 발언을 들려준다.
+            if (brown != null)
+            {
+                brown.HearLine("Player", text);
+            }
+
+            // 두 번째 플레이어 대답 이후 → Toma4 턴을 pending으로
+            currentStep = Step.Toma4;
 
             SetPendingNpcTurn(
-                brown,
-                "방금 플레이어가 이렇게 대답했다: \"" + lastPlayerText + "\" " +
-                "너는 성문을 지키는 메인 문지기로서, 이 사람을 마을에 들여보낼지 말지 거의 결정을 내린 상태다. " +
-                "이번 턴에서는 최종적인 태도나 판단이 느껴지는 한 문장을 말해라."
+                toma,
+                "방금 외지인님이 이렇게 대답했다: \"" + lastPlayerText + "\" " +
+                "외지인의 대답을 평가해라."
             );
         }
     }
@@ -115,77 +150,95 @@ public class GateConversationManager : ConversationManagerBase
         switch (currentStep)
         {
             case Step.Brown1:
+                // 브라운 첫 시비 후 → 토마 첫 반응
                 currentStep = Step.Toma1;
                 StartNpcTurn(
                     toma,
-                    "방금 브라운이 외지인인 플레이어에게 날카롭게 말을 걸었다. " +
-                    "너는 겁이 많아 이 상황이 조금 불안하다. " +
-                    "플레이어를 걱정하거나, 브라운 눈치를 보게 되는 짧은 한 문장을 말해라."
+                    "외지인을 멈춰세워라."
                 );
                 break;
 
             case Step.Toma1:
+                // 토마의 첫 반응 후 → 브라운이 좀 더 구체적으로 캐묻는 질문(이상형 테스트 포함 가능)
                 currentStep = Step.Brown2;
                 StartNpcTurn(
                     brown,
-                    "방금 토마가 긴장한 기색으로 한마디 했다. " +
-                    "너는 여전히 플레이어를 의심하고 있다. " +
-                    "이번 턴에서는 플레이어에게 조금 더 구체적으로 목적이나 정체를 캐묻는 한 문장을 말해라."
+                    "외지인의 신원을 파악해라."
                 );
                 break;
 
             case Step.Brown2:
+                // 브라운의 질문 뒤 → 플레이어 1차 대답 타이밍 (브라운 호감도 결정 구간)
                 currentStep = Step.WaitPlayer1;
                 expectedNpc = null;
 
-                // 이 대답은 직전에 질문을 던진 브라운의 호감도에만 직접 영향을 줌
+                // 이 대답은 직전에 질문을 던진 브라운의 호감도에 직접 영향을 줌
                 answerTargetNpc = brown;
 
                 EnablePlayerInput(true);
                 waitingForPlayerInput = true;
                 break;
 
-            case Step.Toma2:
-                currentStep = Step.Brown3;
+            case Step.Brown3:
+                // 브라운이 플레이어 1차 대답에 대한 반응을 한 뒤 → 토마의 코멘트
+                currentStep = Step.Toma2;
                 StartNpcTurn(
-                    brown,
-                    "지금까지의 플레이어 대답과 토마의 반응을 모두 들었다. " +
-                    "너는 여전히 의심과 경계심을 버리지는 못했지만, 어느 정도 판단이 서기 시작했다. " +
-                    "이번 턴에서는 플레이어를 시험하는 듯한 한 문장을 말해라."
+                    toma,                    
+                    "외지인에 대한 인상을 말해라."
                 );
                 break;
 
-            case Step.Brown3:
+            case Step.Toma2:
+                // 토마의 코멘트 후 → 브라운이 한 번 더 정리하면서 토마에게도 한마디 시키는 흐름
+                currentStep = Step.Brown4;
+                StartNpcTurn(
+                    brown,
+                    "지금까지의 대화를 정리하고 토마에게 질문해라"
+                );
+                break;
+
+            case Step.Brown4:
+                // 브라운이 토마에게도 물어보라 한 뒤 → 토마가 직접 외지인에게 질문 (토마 이상형 테스트용)
                 currentStep = Step.Toma3;
                 StartNpcTurn(
                     toma,
-                    "방금 브라운이 플레이어를 시험하는 말을 했다. " +
-                    "너는 브라운과 플레이어 사이에서 눈치를 보며, 조심스럽게 분위기를 살피는 한 문장을 말해라."
+                    "토마의 질문에 답하며, 외지인에게 너의 마을에 어떻게 왔는지 질문해라." 
                 );
                 break;
 
             case Step.Toma3:
+                // 토마의 질문 뒤 → 플레이어 2차 대답 타이밍 (토마 호감도 결정 구간)
                 currentStep = Step.WaitPlayer2;
                 expectedNpc = null;
 
-                // 두 번째 대답은 바로 앞에서 플레이어를 바라보던 토마의 호감도에 직접 영향
+                // 이 대답은 바로 앞에서 질문을 던진 토마의 호감도에 직접 영향
                 answerTargetNpc = toma;
 
                 EnablePlayerInput(true);
                 waitingForPlayerInput = true;
                 break;
 
-            case Step.Brown4:
-                currentStep = Step.Toma4;
+            case Step.Toma4:
+                // 토마가 플레이어 2차 대답에 대한 반응을 한 뒤 → 브라운이 마지막 정리 멘트
+                currentStep = Step.Brown5;
                 StartNpcTurn(
-                    toma,
-                    "브라운이 플레이어에 대한 최종적인 태도를 드러냈다. " +
-                    "너는 이 분위기 속에서, 플레이어가 너무 상처받지 않기를 바라거나 " +
-                    "조심스럽게 한마디를 덧붙이는 짧은 문장을 말해라."
+                    brown,
+                    "지금까지의 모든 대화 기록을 참고해서, 외지인을 마을에 들일 수 있도록 해라."                    
                 );
                 break;
 
-            case Step.Toma4:
+            case Step.Brown5:
+                // 브라운의 최종 멘트 뒤 → 토마가 마지막으로 한마디
+                currentStep = Step.Toma5;
+                StartNpcTurn(
+                    toma,
+                    "지금까지의 모든 대화 기록을 참고해서, 외지인이 너의 마을에 들일 수 있도록 해라." +
+                    "너의 마을의 촌장이 맞이할 것임을 외지인에게 언급해라."
+                );
+                break;
+
+            case Step.Toma5:
+                // 토마 마지막 멘트 뒤 → 대화 종료
                 currentStep = Step.Done;
                 expectedNpc = null;
                 npcReplyReceived = false;
@@ -197,6 +250,17 @@ public class GateConversationManager : ConversationManagerBase
     private void HandleConversationEnd()
     {
         Debug.Log("[Gate] 게이트 인트로 대화 종료. 다음 씬으로 진행하세요.");
-        // TODO: 씬 전환, 플레이어 이동 등
+
+        // 대화가 모두 끝난 뒤: 화면을 다시 검게 닫는 연출
+        StartCoroutine(SceneEndRoutine());
+    }
+
+    private IEnumerator SceneEndRoutine()
+    {
+        // 밝은 화면 → 검은 화면으로 페이드
+        yield return FadeToBlack();   // ConversationManagerBase에서 제공
+
+        // 페이드가 끝난 뒤에 씬 전환, 플레이어 이동 등 진행
+        // 예: SceneManager.LoadScene("NextScene");
     }
 }

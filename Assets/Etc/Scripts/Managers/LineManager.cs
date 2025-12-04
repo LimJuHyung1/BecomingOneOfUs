@@ -1,5 +1,6 @@
 ﻿using System.Collections;
 using System.Collections.Generic;
+using System.Text;
 using UnityEngine;
 using UnityEngine.UI;
 
@@ -72,12 +73,30 @@ public class LineManager : MonoBehaviour
 
         foreach (var l in lineSO.dialogueLines)
         {
-            lineQueue.Enqueue(l);
+            if (string.IsNullOrWhiteSpace(l.line))
+                continue;
+
+            // 한 줄을 문장별로 나눈다
+            var sentences = SplitIntoSentences(l.line);
+
+            foreach (var sentence in sentences)
+            {
+                Line newLine = new Line
+                {
+                    characterName = l.characterName,
+                    line = sentence,
+                    audioClip = l.audioClip,
+                    nameColor = l.nameColor
+                };
+
+                lineQueue.Enqueue(newLine);
+            }
         }
 
         OpenPanelIfNeeded(0.6f);
-        ShowNextLine();   // 첫 줄은 자동으로 출력 (외부에서 Space로 다음 줄 제어)
+        ShowNextLine();   // 첫 문장은 자동 출력
     }
+
 
     // =============================================================
     // NPC 대사 출력
@@ -87,16 +106,24 @@ public class LineManager : MonoBehaviour
         if (string.IsNullOrEmpty(text))
             return;
 
-        Line line = new Line
-        {
-            characterName = characterName,
-            line = text,
-            audioClip = clip,
-            nameColor = nameColor
-        };
+        var sentences = SplitIntoSentences(text);
+        if (sentences.Count == 0)
+            return;
 
-        EnqueueToNpcQueue(line, 0.3f);
+        foreach (var sentence in sentences)
+        {
+            Line line = new Line
+            {
+                characterName = characterName,
+                line = sentence,
+                audioClip = clip,
+                nameColor = nameColor
+            };
+
+            EnqueueToNpcQueue(line, 0.3f);
+        }
     }
+
 
     // =============================================================
     // 플레이어 대사 출력
@@ -106,15 +133,22 @@ public class LineManager : MonoBehaviour
         if (string.IsNullOrEmpty(text))
             return;
 
-        Line line = new Line
-        {
-            characterName = playerName,
-            line = text,
-            audioClip = null,   // 플레이어는 기본적으로 음성 없음
-            nameColor = nameColor
-        };
+        var sentences = SplitIntoSentences(text);
+        if (sentences.Count == 0)
+            return;
 
-        EnqueueToNpcQueue(line, 0.3f);
+        foreach (var sentence in sentences)
+        {
+            Line line = new Line
+            {
+                characterName = playerName,
+                line = sentence,
+                audioClip = null,   // 플레이어는 기본적으로 음성 없음
+                nameColor = nameColor
+            };
+
+            EnqueueToNpcQueue(line, 0.3f);
+        }
     }
 
     // NPC/플레이어 공용 큐 로직
@@ -133,7 +167,7 @@ public class LineManager : MonoBehaviour
     }
 
     // 패널이 꺼져 있으면 켜고 페이드 인
-    private void OpenPanelIfNeeded(float fadeDuration)
+    public void OpenPanelIfNeeded(float fadeDuration)
     {
         if (linePanel == null)
             return;
@@ -220,6 +254,48 @@ public class LineManager : MonoBehaviour
         isTyping = false;
         typingCoroutine = null;
     }
+
+    // 한 문자열을 문장 단위로 잘라주는 함수
+    private List<string> SplitIntoSentences(string text)
+    {
+        var result = new List<string>();
+
+        if (string.IsNullOrWhiteSpace(text))
+            return result;
+
+        StringBuilder sb = new StringBuilder();
+
+        for (int i = 0; i < text.Length; i++)
+        {
+            char c = text[i];
+            sb.Append(c);
+
+            bool isSentenceEnd =
+                c == '.' || c == '!' || c == '?' ||
+                c == '。' || c == '！' || c == '？';
+
+            bool isLastChar = (i == text.Length - 1);
+            bool nextIsSpaceOrNewLine = !isLastChar && char.IsWhiteSpace(text[i + 1]);
+
+            // 마침표/물음표/느낌표 뒤에 공백(또는 문자열 끝)이 오면 문장 하나로 처리
+            if (isSentenceEnd && (isLastChar || nextIsSpaceOrNewLine))
+            {
+                string sentence = sb.ToString().Trim();
+                if (!string.IsNullOrEmpty(sentence))
+                    result.Add(sentence);
+
+                sb.Clear();
+            }
+        }
+
+        // 마지막에 남은 문자열 처리 (마침표 없이 끝난 경우)
+        string remaining = sb.ToString().Trim();
+        if (!string.IsNullOrEmpty(remaining))
+            result.Add(remaining);
+
+        return result;
+    }
+
 
     // =============================================================
     // 타이핑 즉시 완성

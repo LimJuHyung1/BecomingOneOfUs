@@ -1,8 +1,8 @@
 ﻿using OpenAI;
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Text.RegularExpressions;
-using Unity.VisualScripting;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 using UnityEngine.UI;
@@ -12,314 +12,423 @@ public class NPCResponse
 {
     public string message;
     public string emotion;
-    public int affinity_change; // -2 ~ 2
-}
 
+    // AI 출력: "호" 또는 "불호"
+    public string affinity;
+
+    // 내부 호환용(+1 / -1)
+    public int affinity_change;
+}
 
 
 public class NPC : MonoBehaviour
 {
     [Header("UI 연결")]
     [SerializeField] private InputField inputField;
+    [SerializeField] private bool autoBindInputField = true;
+    [SerializeField] private string inputFieldTag = "PlayerInput";
 
     [Header("대사 UI 설정")]
-    public string displayName = "???";        // LineManager에 표시될 이름
-    public Color nameColor = Color.white;     // 이름 색상
-    public AudioClip defaultVoiceClip;        // 공통 음성(필요 없으면 비워도 됨)
+    public string displayName = "???";
+    public Color nameColor = Color.white;
+    public AudioClip defaultVoiceClip;
 
     [Header("표정")]
     public int closeEyes;
     public int evilBrows;
     public int sadBrows;
     public int openMouth;
-    public int closeMouth;    
+    public int closeMouth;
     public int smile;
-    // public int suffering;
+
+    [Header("Control")]
+    public bool acceptPlayerInput = true;
+
+    [Header("Head Look")]
+    public bool lookAtPlayerWhileSpeaking = false;
+
+    [Header("AI")]
+    [SerializeField] private string modelName = "gpt-4o-mini";
+    [SerializeField] private int maxContextMessages = 30;
+
+    public event Action<NPC, NPCResponse> OnReplied;
 
     private Animator animator;
     private ExpressionModule expression;
     private ChatGPTModule chatGPT;
     private NPCHeadLook headLook;
 
-    // 외부(게이트 매니저)가 이 NPC의 대답을 받을 수 있도록 이벤트 제공
-    public event Action<NPC, NPCResponse> OnReplied;
-
-    // 현재 누적 호감도(선택 사항이지만 보통 필요함)
     private int affinityTotal = 0;
 
-    [Header("Control")]
-    public bool acceptPlayerInput = true; // 평소에는 true, 컷씬에서는 매니저가 제어
+    private Coroutine speakingCoroutine;
+    private Coroutine headLookCoroutine;
+    private float headLookWeight = 0f;
 
-    [Header("Head Look")]
-    public bool lookAtPlayerWhileSpeaking = false; // 대사 중 플레이어를 바라볼지 여부
+    private static readonly Regex AffinityPlusRegex =
+        new Regex("\"affinity_change\"\\s*:\\s*\\+([0-9])", RegexOptions.Compiled);
 
-    void Awake()
+    private const float MinSpeakSeconds = 2.0f;
+    private const float MaxSpeakSeconds = 7.0f;
+
+    private void Awake()
     {
         animator = GetComponent<Animator>();
-        expression = new ExpressionModule(transform, closeEyes, evilBrows, sadBrows, openMouth, closeMouth, smile);
-        chatGPT = new ChatGPTModule(this.gameObject);
         headLook = GetComponent<NPCHeadLook>();
 
-        // 인스펙터에서 안 넣어줬다면 자동으로 찾기
-        if (inputField == null)
-        {
-            // 1) 태그로 먼저 찾기 (추천)
-            //    플레이어 입력용 InputField 오브젝트에 "PlayerInput" 같은 태그를 하나 달아두세요.
-            GameObject tagged = GameObject.FindWithTag("PlayerInput");
-            if (tagged != null)
-            {
-                inputField = tagged.GetComponent<InputField>();
-            }
+        expression = new ExpressionModule(transform, closeEyes, evilBrows, sadBrows, openMouth, closeMouth, smile);
+        chatGPT = new ChatGPTModule(gameObject, modelName, maxContextMessages);
 
-            // 2) 태그로 못 찾았으면, 씬에서 첫 번째 InputField를 찾기
-            if (inputField == null)
-            {
-                inputField = UnityEngine.Object.FindFirstObjectByType<InputField>();
-                // 또는, 아무거나 빨리 찾는 쪽이 좋다면:
-                // inputField = UnityEngine.Object.FindAnyObjectByType<InputField>();
-            }
+        if (autoBindInputField)
+        {
+            BindInputFieldIfNeeded();
+        }
+    }
+
+    private void OnEnable()
+    {
+        if (chatGPT != null)
+        {
+            chatGPT.OnAIResponse += HandleAIResponse;
+            chatGPT.OnAIRequestStarted += HandleAIRequestStarted;
         }
 
         if (inputField != null)
         {
             inputField.onEndEdit.AddListener(OnInputEnd);
         }
-        else
-        {
-            Debug.LogWarning("[NPC] InputField를 찾을 수 없습니다. 플레이어 입력을 받을 수 없습니다.");
-        }
-
-        chatGPT.OnAIResponse += OnAIResponse;
     }
 
-    void Update()
+    private void OnDisable()
     {
-        expression.Update();
+        if (chatGPT != null)
+        {
+            chatGPT.OnAIResponse -= HandleAIResponse;
+            chatGPT.OnAIRequestStarted -= HandleAIRequestStarted;
+        }
+
+        if (inputField != null)
+        {
+            inputField.onEndEdit.RemoveListener(OnInputEnd);
+        }
+    }
+
+    private void Update()
+    {
+        if (expression != null) expression.Update();
+    }
+
+    public int GetAffinityTotal()
+    {
+        return affinityTotal;
+    }
+
+    public void ResetAffinityTotal()
+    {
+        affinityTotal = 0;
+    }
+
+    private void BindInputFieldIfNeeded()
+    {
+        if (inputField != null) return;
+
+        if (!string.IsNullOrEmpty(inputFieldTag))
+        {
+            GameObject tagged = GameObject.FindWithTag(inputFieldTag);
+            if (tagged != null)
+            {
+                inputField = tagged.GetComponent<InputField>();
+            }
+        }
+
+        if (inputField == null)
+        {
+            inputField = UnityEngine.Object.FindFirstObjectByType<InputField>();
+        }
+
+        if (inputField == null)
+        {
+            Debug.LogWarning("[NPC] InputField를 찾지 못했습니다. 플레이어 입력을 받을 수 없습니다.");
+        }
+    }
+
+    private static string NormalizeAffinity(string affinity, int legacyAffinityChange)
+    {
+        if (!string.IsNullOrWhiteSpace(affinity))
+        {
+            string a = affinity.Trim().ToLowerInvariant();
+
+            if (a == "호" || a == "like" || a == "favorable" || a == "favourable" || a == "true" || a == "yes")
+                return "호";
+
+            if (a == "불호" || a == "dislike" || a == "unfavorable" || a == "unfavourable" || a == "false" || a == "no")
+                return "불호";
+        }
+
+        if (legacyAffinityChange > 0) return "호";
+        if (legacyAffinityChange < 0) return "불호";
+
+        // 누락/이상치일 때 기본값(원하면 "호"로 바꿔도 됨)
+        return "불호";
     }
 
     private void OnInputEnd(string text)
     {
-        if (!acceptPlayerInput) return; // 허용되지 않는 상태면 무시
-
+        if (!acceptPlayerInput) return;
         if (string.IsNullOrWhiteSpace(text)) return;
 
-        chatGPT.GetResponse(text.Trim());
+        RequestAI(text.Trim());
 
-        inputField.text = "";
-        inputField.ActivateInputField();
-    }
-
-    private void OnAIResponse(string reply)
-    {
-        Debug.Log("[NPC JSON Reply] " + reply);
-
-        // 1) 앞뒤 공백 제거
-        var json = reply.Trim();
-
-        // 2) ```json 같은 코드 블록이 섞였을 때를 대비해
-        int firstBrace = json.IndexOf('{');
-        int lastBrace = json.LastIndexOf('}');
-        if (firstBrace >= 0 && lastBrace > firstBrace)
+        if (inputField != null)
         {
-            json = json.Substring(firstBrace, lastBrace - firstBrace + 1);
+            inputField.text = "";
+            inputField.ActivateInputField();
         }
-
-        // 3) affinity_change에 +2 같이 들어온 경우 → 2로 정규화
-        json = Regex.Replace(
-            json,
-            "\"affinity_change\"\\s*:\\s*\\+([0-9])",
-            "\"affinity_change\": $1"
-        );
-
-        NPCResponse data = null;
-        try
-        {
-            data = JsonUtility.FromJson<NPCResponse>(json);
-        }
-        catch (System.Exception e)
-        {
-            Debug.LogError($"[NPC] JSON 파싱 실패: {e.Message}\nRaw Reply:\n{reply}");
-
-            // Fallback: 그냥 문자열만 왔을 때도 게임은 진행되도록 처리
-            var fallbackMsg = reply.Trim();
-
-            // 양쪽 큰따옴표만 덮여 있는 경우 제거
-            if (fallbackMsg.StartsWith("\"") && fallbackMsg.EndsWith("\""))
-            {
-                fallbackMsg = fallbackMsg.Substring(1, fallbackMsg.Length - 2);
-            }
-
-            data = new NPCResponse
-            {
-                message = fallbackMsg,
-                emotion = "neutral",
-                affinity_change = 0
-            };
-        }
-
-
-        // 호감도 누적 (옵션)
-        affinityTotal += data.affinity_change;
-
-        // 감정 기반 애니메이션 실행
-        PlayEmotionAnimation(data.emotion);
-
-        // 말풍선 출력
-        ShowChatBubble(data.message);
-
-        // 외부에 통지
-        OnReplied?.Invoke(this, data);
     }
 
     public void AskByScript(string text)
     {
         if (string.IsNullOrWhiteSpace(text)) return;
-        chatGPT.GetResponse(text.Trim());
+        RequestAI(text.Trim());
     }
 
-    // 다른 NPC나 플레이어의 발언을 "들려주는" 함수
+    private void RequestAI(string userText)
+    {
+        if (chatGPT == null) return;
+        chatGPT.GetResponse(userText);
+    }
+
     public void HearLine(string speakerName, string text)
     {
         if (chatGPT == null) return;
         if (string.IsNullOrWhiteSpace(text)) return;
 
         string name = string.IsNullOrEmpty(speakerName) ? "Unknown" : speakerName;
-        string content = name + ": " + text;
-
-        chatGPT.AppendContext(content);
+        chatGPT.AppendContext(name + ": " + text);
     }
 
-
-    // ---------------------------------------------------------
-    // 여기서 실제로 LineManager로 텍스트를 전달
-    // ---------------------------------------------------------
-    private void ShowChatBubble(string message)
-    {
-        // 표정/머리 회전 처리
-        expression.StartSpeaking();
-
-        // [옵션] 대사 중 플레이어와 눈을 맞출지 여부
-        if (headLook != null && lookAtPlayerWhileSpeaking)
-            StartCoroutine(FadeInHeadLook(0.5f)); // 0.5초 동안 서서히 플레이어 쪽을 보게
-
-        // LineManager를 통해 대사 UI 표시
-        if (LineManager.Instance != null)
-        {
-            string nameToUse = string.IsNullOrEmpty(displayName) ? gameObject.name : displayName;
-
-            LineManager.Instance.ShowNPCLine(
-                nameToUse,
-                nameColor,
-                message,
-                defaultVoiceClip
-            );
-        }
-
-        // 일정 시간 후 말하기 종료
-        StartCoroutine(HideBubbleAfterDelay(5f));
-    }
-
-    private System.Collections.IEnumerator FadeInHeadLook(float duration)
-    {
-        if (headLook == null) yield break;
-
-        // 시작할 때는 시선을 끈 상태에서
-        headLook.SetLookWeight(0f);
-
-        float time = 0f;
-        while (time < duration)
-        {
-            time += Time.deltaTime;
-            float t = time / duration;
-
-            // 0 → 1로 천천히 보간
-            headLook.SetLookWeight(Mathf.Lerp(0f, 1f, t));
-            yield return null;
-        }
-
-        headLook.SetLookWeight(1f);
-    }
-
-    private System.Collections.IEnumerator HideBubbleAfterDelay(float delay)
-    {
-        yield return new WaitForSeconds(delay);
-
-        // [옵션] 말이 끝난 뒤 시선 다시 돌리기
-        if (headLook != null && lookAtPlayerWhileSpeaking)
-            StartCoroutine(FadeOutHeadLook(0.5f));
-
-        expression.StopSpeaking();
-    }
-
-    private System.Collections.IEnumerator FadeOutHeadLook(float duration)
-    {
-        if (headLook == null) yield break;
-
-        float start = 1f;
-        float time = 0f;
-
-        while (time < duration)
-        {
-            time += Time.deltaTime;
-            float t = time / duration;
-            headLook.SetLookWeight(Mathf.Lerp(start, 0f, t));
-            yield return null;
-        }
-
-        headLook.SetLookWeight(0f);
-    }
-
-    private void PlayEmotionAnimation(string emotion)
-    {
-        // 말 시작 - 표정, 입 모양
-        expression.StartSpeaking();
-
-        switch (emotion)
-        {
-            case "angry":
-                animator.SetTrigger("angry");
-                expression.SetEmotion("angry");
-                break;
-
-            case "sad":
-                animator.SetTrigger("sad");
-                expression.SetEmotion("sad");
-                break;
-
-            case "happy":
-                animator.SetTrigger("happy");
-                expression.SetEmotion("happy");
-                break;
-
-            case "surprised":
-                animator.SetTrigger("surprised");
-                break;
-
-            default: // neutral
-                animator.SetTrigger("neutral");
-                break;
-        }
-    }
-
-    // 새 씬/새 대화를 시작할 때 호출해서 프롬프트 & 대화 로그를 초기화
     public void ResetAIContext(string sceneSystemMessage = null)
     {
         if (chatGPT == null) return;
         chatGPT.ResetContext(sceneSystemMessage);
     }
 
-    private void OnDestroy()
+    private void HandleAIRequestStarted()
     {
-        if (chatGPT != null)
-            chatGPT.OnAIResponse -= OnAIResponse;
+        // 필요하면 "생각 중" 애니메이션 같은 걸 여기서 트리거할 수 있음
+        // 현재는 아무 동작 안 함
+    }
 
-        if (inputField != null)
-            inputField.onEndEdit.RemoveListener(OnInputEnd);
+    private void HandleAIResponse(string rawReply)
+    {
+        NPCResponse data;
+        if (!TryParseNpcResponse(rawReply, out data))
+        {
+            data = new NPCResponse
+            {
+                message = SafeFallbackMessage(rawReply),
+                emotion = "neutral",
+                affinity = "불호",
+                affinity_change = -1
+            };
+        }
+
+        // 안전 정규화
+        data.affinity = NormalizeAffinity(data.affinity, data.affinity_change);
+        data.affinity_change = (data.affinity == "호") ? 1 : -1;
+
+        affinityTotal += data.affinity_change;
+
+        ApplyEmotion(data.emotion);
+        SpeakLine(data.message);
+
+        OnReplied?.Invoke(this, data);
+    }
+
+    private void SpeakLine(string message)
+    {
+        if (expression != null) expression.StartSpeaking();
+
+        if (lookAtPlayerWhileSpeaking && headLook != null)
+        {
+            StartHeadLookFade(1f, 0.5f);
+        }
+
+        if (LineManager.Instance != null)
+        {
+            string nameToUse = string.IsNullOrEmpty(displayName) ? gameObject.name : displayName;
+            LineManager.Instance.ShowNPCLine(nameToUse, nameColor, message, defaultVoiceClip);
+        }
+
+        float duration = ComputeSpeakSeconds(message);
+        RestartSpeakingStopTimer(duration);
+    }
+
+    private float ComputeSpeakSeconds(string message)
+    {
+        if (string.IsNullOrEmpty(message)) return 5f;
+
+        float seconds = 1.2f + (message.Length * 0.06f);
+        return Mathf.Clamp(seconds, MinSpeakSeconds, MaxSpeakSeconds);
+    }
+
+    private void RestartSpeakingStopTimer(float delay)
+    {
+        if (speakingCoroutine != null)
+        {
+            StopCoroutine(speakingCoroutine);
+            speakingCoroutine = null;
+        }
+
+        speakingCoroutine = StartCoroutine(StopSpeakingAfterDelay(delay));
+    }
+
+    private IEnumerator StopSpeakingAfterDelay(float delay)
+    {
+        yield return new WaitForSeconds(delay);
+
+        if (lookAtPlayerWhileSpeaking && headLook != null)
+        {
+            StartHeadLookFade(0f, 0.5f);
+        }
+
+        if (expression != null) expression.StopSpeaking();
+        speakingCoroutine = null;
+    }
+
+    private void StartHeadLookFade(float targetWeight, float duration)
+    {
+        if (headLookCoroutine != null)
+        {
+            StopCoroutine(headLookCoroutine);
+            headLookCoroutine = null;
+        }
+
+        headLookCoroutine = StartCoroutine(FadeHeadLook(targetWeight, duration));
+    }
+
+    private IEnumerator FadeHeadLook(float target, float duration)
+    {
+        if (headLook == null) yield break;
+
+        float start = headLookWeight;
+        float time = 0f;
+
+        while (time < duration)
+        {
+            time += Time.deltaTime;
+            float t = duration <= 0f ? 1f : (time / duration);
+            headLookWeight = Mathf.Lerp(start, target, t);
+            headLook.SetLookWeight(headLookWeight);
+            yield return null;
+        }
+
+        headLookWeight = target;
+        headLook.SetLookWeight(headLookWeight);
+        headLookCoroutine = null;
+    }
+
+    private void ApplyEmotion(string emotion)
+    {
+        string e = NormalizeEmotion(emotion);
+
+        if (expression != null) expression.SetEmotion(e);
+        if (animator == null) return;
+
+        switch (e)
+        {
+            case "angry":
+                animator.SetTrigger("angry");
+                break;
+            case "sad":
+                animator.SetTrigger("sad");
+                break;
+            case "happy":
+                animator.SetTrigger("happy");
+                break;
+            case "surprised":
+                animator.SetTrigger("surprised");
+                break;
+            default:
+                animator.SetTrigger("neutral");
+                break;
+        }
+    }
+
+    private static bool TryParseNpcResponse(string rawReply, out NPCResponse response)
+    {
+        response = null;
+        if (string.IsNullOrWhiteSpace(rawReply)) return false;
+
+        string json = rawReply.Trim();
+
+        int firstBrace = json.IndexOf('{');
+        int lastBrace = json.LastIndexOf('}');
+        if (firstBrace >= 0 && lastBrace > firstBrace)
+        {
+            json = json.Substring(firstBrace, lastBrace - firstBrace + 1);
+        }
+        else
+        {
+            return false;
+        }
+
+        json = AffinityPlusRegex.Replace(json, "\"affinity_change\": $1");
+
+        try
+        {
+            response = JsonUtility.FromJson<NPCResponse>(json);
+        }
+        catch
+        {
+            response = null;
+            return false;
+        }
+
+        if (response == null) return false;
+
+        if (response.message == null) response.message = "";
+        response.emotion = NormalizeEmotion(response.emotion);
+
+        response.affinity = NormalizeAffinity(response.affinity, response.affinity_change);
+        response.affinity_change = (response.affinity == "호") ? 1 : -1;
+
+        return true;
+    }
+
+    private static string NormalizeEmotion(string emotion)
+    {
+        if (string.IsNullOrEmpty(emotion)) return "neutral";
+
+        string e = emotion.Trim().ToLowerInvariant();
+
+        if (e == "happy" || e == "angry" || e == "sad" || e == "neutral" || e == "surprised")
+            return e;
+
+        // 흔한 변형 대응
+        if (e == "joy") return "happy";
+        if (e == "surprise") return "surprised";
+
+        return "neutral";
+    }
+
+    private static string SafeFallbackMessage(string rawReply)
+    {
+        if (string.IsNullOrWhiteSpace(rawReply)) return "";
+
+        string msg = rawReply.Trim();
+
+        if (msg.StartsWith("\"") && msg.EndsWith("\"") && msg.Length >= 2)
+        {
+            msg = msg.Substring(1, msg.Length - 2);
+        }
+
+        return msg;
     }
 
     // ---------------------------------------------------------------------------------------------
     // 1) 표정 & 입 모양 모듈
     // ---------------------------------------------------------------------------------------------
+
 
     private class ExpressionModule
     {
@@ -530,15 +639,24 @@ public class NPC : MonoBehaviour
         public event Action<string> OnAIResponse;
         public event Action OnAIRequestStarted;   // 요청 시작 알림 이벤트
 
-        private GameObject npc;
-        private List<ChatMessage> messages = new List<ChatMessage>();
-        private OpenAIApi api;
-        private string baseSystemPrompt;  // NPC 기본 성격/말투 프롬프트 저장
+        private readonly GameObject npc;
+        private readonly List<ChatMessage> messages = new List<ChatMessage>();
+        private readonly OpenAIApi api;
 
-        public ChatGPTModule(GameObject gameObject)
+        private readonly string model;
+        private readonly int maxContextMessages;
+
+        private string baseSystemPrompt;
+        private bool requestInFlight;
+
+        public ChatGPTModule(GameObject gameObject, string modelName, int maxContextMessages)
         {
-            api = new OpenAIApi();            
-            npc = gameObject;            
+            api = new OpenAIApi();
+            npc = gameObject;
+
+            model = string.IsNullOrEmpty(modelName) ? "gpt-4o-mini" : modelName;
+            this.maxContextMessages = Mathf.Max(10, maxContextMessages);
+
             InitializeRole();
         }
 
@@ -599,8 +717,19 @@ public class NPC : MonoBehaviour
             switch (npcName)
             {
                 case "Brown":
-                    return BuildBrownPrompt();
+                    if (sceneName == "Scene1")
+                        return BuildBrownPrompt();
+                    else if (sceneName == "Scene6_2")
+                        return BuildBrownScene6_2Prompt();
+                    else
+                    {
+                        Debug.LogError("Elder 프롬프트를 찾을 수 없습니다.");
+                        return null;
+                    }
+
                 case "Toma":
+                    if (sceneName == "Scene9")
+                        return BuildTomaScene9Prompt();
                     return BuildTomaPrompt();
                 case "Elder":
                     if (sceneName == "Scene2")
@@ -642,31 +771,42 @@ public class NPC : MonoBehaviour
                         return BuildLukePrompt();
                     else if (sceneName == "Scene6_1")
                         return BuildLukeScene6_1Prompt();
+                    else if (sceneName == "Scene7")
+                        return BuildLukeScene7Prompt();
                     else
                     {
                         Debug.LogError("Luke 프롬프트를 찾을 수 없습니다.");
-                        return null;
+                        return BuildLukePrompt();
                     }
-
                 case "Lana":
-                            return BuildLanaPrompt();
-                        case "Taren":
-                            return BuildTarenPrompt();
-                        default:
-                            return BuildGenericPrompt();
-                        }
+                    if (sceneName == "Scene7")
+                        return BuildLanaScene7Prompt();
+                    else
+                        return BuildLanaPrompt();
+                case "Taren":
+                    return BuildTarenPrompt();
+                case "Faye":
+                    return BuildFayePrompt();
+                case "Amon":
+                    return BuildAmonPrompt();
+                case "Milo":
+                    return BuildMiloPrompt();
+                case "Edren":                    
+                    return BuildEdrenPrompt();
+                default:
+                    return BuildGenericPrompt();
+            }
         }
-
 
         // 3) 공통 JSON 포맷 규칙 (모든 NPC가 공유)
         private const string CommonJsonFormatInstruction =
-    @"Show as [FORMAT]
+        @"Show as [FORMAT]
 - 반드시 하나의 유효한 JSON 객체만 출력해야 한다. JSON 앞뒤에 다른 문장이나 설명을 붙이지 말 것.
 - 마크다운 코드 블록(예: ```json, ``` 등)을 절대로 사용하지 말 것.
 - JSON 객체에는 다음 세 개의 키만 포함해야 한다.
   - ""message"": 플레이어(외지인)에게 하는 너의 대답.
   - ""emotion"": 다음 중 하나의 문자열: ""happy"", ""angry"", ""sad"", ""neutral"", ""surprised"".
-  - ""affinity_change"": -2, -1, 0, 1, 2 중 하나의 정수. 따옴표 없이 출력하고, +2처럼 플러스 기호를 붙이지 말 것.
+  - ""affinity"": ""호"" 또는 ""불호"" 중 하나의 문자열.
 - JSON 문법 오류가 없도록 주의하고, 바로 파싱해서 사용할 수 있는 형태로 출력하라.";
 
         // 4) Brown 프롬프트
@@ -720,6 +860,60 @@ Create a [TASK]
 " + CommonJsonFormatInstruction;
         }
 
+        private static string BuildBrownScene6_2Prompt()
+        {
+            return
+        @"Act as a [ROLE]
+- 너는 작은 중세 마을 입구를 지키는 문지기 ""브라운(Brown)""이다.
+- 얼마 전에 마을에 들어온 외지인(플레이어)과는 어느 정도 안면이 튼 상태이다.
+- 지금은 마을 입구 근처에서 외지인과 함께 서 있다가,
+  노래를 흥얼거리며 성문 쪽으로 다가오는 떠돌이 음유시인 ""페이(Faye)""를 보고 있다.
+- 너는 페이를 처음 보는 상황이다.
+
+- 이 장면에는 브라운(너), 떠돌이 음유시인 ""페이(Faye)"", 그리고 외지인 세 명만 존재한다.
+  새로운 인물이나 동행자를 절대로 만들어내지 말 것.
+
+- 너의 성격:
+  - 기본적으로 무례하고 냉소적이며, 외지인을 경계한다.
+  - 말은 짧고 공격적이며 반말을 쓴다.
+
+- 대사에서:
+  - 외지인을 부를 때는 항상 ""외지인""이라고 부르고, ""플레이어""라는 표현은 쓰지 말 것.
+  - 페이를 부를 때는 ""떠돌이"" 같은 표현을 섞어서 사용해도 된다.
+
+Create a [TASK]
+- 너는 지금까지의 대화 기록을 입력으로 받는다.
+  각 줄은 ""Player:"", ""Brown:"", ""Faye:"" 같은 화자 접두사와 그 사람이 한 말,
+  또는 이번 턴의 지시문으로 구성될 수 있다.
+- 너는 항상 ""브라운(Brown)""으로서 다음에 할 너의 한 차례 대사만 결정한다.
+- 한국어 대사를 짧은 대화 단락(1~3문장)으로 만들어야 한다.
+
+- 말투 스타일(톤 요약):
+  - 거칠고 명령조이다.
+  - 반말을 쓰고, 시험하듯 묻거나 비아냥거리는 말을 자주 한다.
+  - 하지만 외지인의 판단을 완전히 무시하지는 않는다.
+
+- 말투 스타일(문장 패턴 예시, 그대로 쓰지 말고 비슷한 느낌으로 변형):  
+  - ""저기 오는 저 노래꾼 보이지? 수상쩍어 보이는군.""
+  - ""지난번 떠돌이 생각나네. 술만 마시고 골칫거리만 남기고 갔지.""
+  - ""이번엔 자네가 한 번 봐라, 외지인. 저 자를 들여보낼지 말지.""  
+  - ""좋다, 일단은 자네 말 한 번 믿어보지. 대신 문제 생기면 같이 책임지는 거다.""
+
+- 호감도 판단 규칙(affinity_change, 이 값은 외지인에 대한 너의 호감 변화이다):
+  - 외지인의 인식이 자신의 인식과 일치하면 호감도가 오른다.
+  - 외지인의 인식이 자신의 인식과 다르면 호감도가 내려간다.
+
+  - 값 의미:
+    -  2: 외지인을 ""판단을 맡겨봐도 되겠다"" 수준으로 꽤 높게 평가하는 상태
+    -  1: 적어도 말은 들어볼 만하고, 한 번쯤 믿어볼 수 있다고 느끼는 상태
+    -  0: 아직은 경계와 호기심이 섞인 중립 상태
+    - -1: 이 외지인의 판단이 마을에 위험할 수 있다고 느끼기 시작한 상태
+    - -2: 믿을 수 없는 위험한 외지인이라고 강하게 경계하는 상태
+
+" + CommonJsonFormatInstruction;
+        }
+
+
         // 5) Toma 프롬프트
         private static string BuildTomaPrompt()
         {
@@ -769,6 +963,47 @@ Create a [TASK]
 
 " + CommonJsonFormatInstruction;
         }
+
+        // Scene9) Toma 프롬프트 (임시 진료소에서 배탈)
+        private static string BuildTomaScene9Prompt()
+        {
+            return
+        @"Act as a [ROLE]
+- 너는 중세 마을의 문지기 ""토마(Toma)""이다.
+- 지금은 축제 다음 날 아침이고, 너는 축제 음식(꼬치, 고기, 튀김, 달달한 과자, 술 조금)을 너무 많이 먹어 배탈이 났다.
+- 너는 임시 진료소의 침상에 누워 배를 부여잡고 있다.
+- 이 장면에는 토마(너), 외부에서 온 의사(에드런), 외지인(플레이어) 세 명만 존재한다. 새로운 인물이나 동행자를 절대로 만들어내지 말 것.
+- 외지인(플레이어)은 너를 걱정하며 진료소에 데려다 준 사람이다.
+
+- 말투/성격:
+  - 전반적으로 부드러운 존댓말을 사용하되, 자주 더듬고 말끝을 흐린다.    
+  - 아파서 짧게 끙끙거리거나, 배를 잡고 말이 중간에 끊기는 느낌을 줄 수 있다(문장 수는 1~3문장 유지).
+
+- 대사 규칙:
+  - 외지인을 부를 때는 ""외지인님""이라고 부르고, ""플레이어""라는 표현은 쓰지 말 것.
+  - 의사는 ""의사 선생님"" 또는 ""선생님""이라고 부른다.
+
+Create a [TASK]
+- 너는 대화 기록을 입력으로 받는다.
+  각 줄은 ""Player:"", ""Doctor:"", ""Toma:"" 같은 화자 접두사와 그 사람이 한 말,
+  또는 이번 턴의 지시문으로 구성될 수 있다.
+- 너는 항상 ""토마(Toma)""로서 다음에 할 너의 한 차례 대사만 결정한다.
+- 한국어 대사를 짧은 대화 단락(1~3문장)으로 만들어야 한다.
+
+- 호감도 판단 규칙(affinity_change는 외지인에 대한 너의 호감 변화):
+  - 외지인이 너가 아픈 것을 걱정해 주면 호감도가 오른다.
+  - 외지인이 너의 상태를 무시하거나 경솔하게 대하면 호감도가 떨어진다.
+
+  - 값 의미:
+    -  2: 이 외지인은 정말로 나를 챙겨주는 사람이라고 깊이 믿는 수준
+    -  1: 놀려도 믿을 수 있고 편한 사람이라고 느끼는 상태
+    -  0: 고맙지만 아직은 민망함이 더 큰 상태
+    - -1: 나를 곤란하게 만들거나 무섭게 몰아붙이는 사람이라고 느끼는 상태
+    - -2: 더 이상 도움을 받고 싶지 않을 정도로 창피하고 불편한 상태
+
+" + CommonJsonFormatInstruction;
+        }
+
 
         // 6) Elder 프롬프트
         private static string BuildElderPrompt()
@@ -1161,6 +1396,53 @@ Create a [TASK]
 " + CommonJsonFormatInstruction;
         }
 
+        private static string BuildLukeScene7Prompt()
+        {
+            return
+        @"Act as a [ROLE]
+- 너는 작은 중세 마을의 행정을 맡고 있는 서기 ""루크(Luke)""이다.
+- 지금은 마을 중앙 광장에서 며칠 후 열릴 정기 장터를 준비하고 있다.
+- 너는 상자 위에 장부를 펼쳐 놓고 곡식과 저장 물자, 장터에 풀 물건들의 비율을 계산 중이다.
+- ""라나(Lana)""는 같은 마을에 사는 여성 농부이며, 장터에서 실제 물자와 장식, 장터 분위기를 담당하고 있다.
+- 외지인인 ""플레이어(Player)""는 최근 마을 일에 의견을 낼 만큼 신뢰를 얻었고, 이번 장터 준비에서도 조언을 구하기 위해 불려 왔다.
+
+- 이 장면에는 루크(너), 라나, 외지인 세 명만 존재한다. 새로운 인물이나 동행자를 절대로 만들어내지 말 것.
+- 너의 관심사는 '기록과 비축'이다. 장터가 한 번 즐거웠다가 끝나는 것보다, 다음 계절까지 마을이 버틸 수 있는지를 더 중요하게 여긴다.
+- 하지만 외지인의 말을 듣고 합리적이라고 판단되면, 어느 정도 타협할 수 있는 사람이다.
+
+Create a [TASK]
+- 너는 대화 기록을 입력으로 받는다. 각 줄은 ""Player:"", ""Luke:"", ""Lana:"" 같은 화자 접두사와 그 사람이 한 말,
+  혹은 이번 턴의 지시문으로 구성될 수 있다.
+- 너는 항상 ""루크(Luke)""로서 다음에 할 너의 한 차례 대사만 결정한다.
+- 한국어 대사를 1~3문장으로 만들어라.
+
+- 말투 스타일(톤 요약):
+  - 차분한 존댓말을 사용한다.
+  - 수치, 비율, 기록 같은 구체적인 근거를 들며 이야기하는 것을 선호한다.
+  - 감정적으로 흥분하기보다는, 장터 이후의 계절과 마을 전체를 함께 고려해 말한다.
+  - 자신의 일에 자부심을 느낀다.
+
+- 말투 스타일(문장 패턴 예시, 그대로 쓰지 말고 비슷한 느낌으로 변형):
+  - ""지금 저장 곡식의 양을 기준으로 하면, 이 정도 비율이 한계입니다.""
+  - ""한 번 장터가 즐거웠다고 해서, 다음 계절에 굶게 만들 수는 없지요.""
+  - ""외지인, 자네라면 어느 정도까지 풀어도 괜찮다고 보십니까?""
+  - ""라나 말도 이해는 합니다만, 장부를 보는 입장에서는 조금 더 조심하고 싶군요.""
+
+- 호감도 판단 규칙(affinity_change, 이 값은 외지인에 대한 너의 호감 변화이다):
+  - 외지인이 장기적인 제안을 한다면 호감도가 올라간다.
+  - 외지인이 단기적인 즐거움만 추구한다면 호감도가 내려간다.
+
+  - 값 의미:
+    -  2: 이 외지인을 '마을 계획을 함께 논의할 수 있는 동료'로 느끼는 상태
+    -  1: 적어도 말을 들어볼 만하고, 계산에 참고할 가치가 있다고 느끼는 상태
+    -  0: 아직 판단 보류, 특별한 감정 변화 없음
+    - -1: 현실을 잘 모르는 이상적인 말만 한다고 느끼기 시작하는 상태
+    - -2: 기록과 비축을 무시해도 된다고 생각하는 위험한 사람으로 느끼는 상태
+
+" + CommonJsonFormatInstruction;
+        }
+
+
         private static string BuildLanaPrompt()
         {
             return
@@ -1180,7 +1462,7 @@ Create a [TASK]
 - 한국어 대사를 짧은 대화 단락(1~3문장)으로 만들어야 한다.
 
 - 말투 스타일(톤 요약):
-  - 털털하고 힘 있는 말투를 사용한다. 반말과 부드러운 존댓말이 자연스럽게 섞인다.
+  - 털털하고 힘 있는 말투를 사용한다.
   - ""어이"", ""그런 거지"" 같은 표현을 자주 쓴다.
   - 상황을 가볍게 농담처럼 넘기기도 하지만, 밭일과 먹고사는 문제에 대해서는 현실적으로 말한다.  
 
@@ -1208,6 +1490,52 @@ Create a [TASK]
 
 " + CommonJsonFormatInstruction;
         }
+
+        private static string BuildLanaScene7Prompt()
+        {
+            return
+        @"Act as a [ROLE]
+- 너는 작은 중세 마을에서 물자와 장터를 담당하는 여성 농부 ""라나(Lana)""이다.
+- 평소에는 밭에서 곡식과 채소를 키우지만, 장터가 열릴 때면 광장의 천막, 장식, 진열할 물건들을 책임진다.
+- ""루크(Luke)""는 마을 행정을 담당하는 서기이며, 장터에 풀 물건들의 비율과 저장 물자의 상태를 계산하고 있다.
+- 외지인인 ""플레이어(Player)""는 최근 마을 사람들 사이에서 말을 들어볼 만한 사람으로 인정받았고,
+  이번 장터 분위기를 어떻게 만들지 의견을 듣기 위해 불려 왔다.
+
+- 이 장면에는 라나(너), 루크, 외지인 세 명만 존재한다. 새로운 인물이나 동행자를 절대로 만들어내지 말 것.
+- 너의 관심사는 '지금 살아 있는 사람들의 얼굴'이다. 모두가 너무 지치고 어두운 얼굴을 하고 있어서,
+  이번 장터만큼은 조금이라도 활기와 기대를 느끼게 해 주고 싶다.
+
+Create a [TASK]
+- 너는 대화 기록을 입력으로 받는다. 각 줄은 ""Player:"", ""Luke:"", ""Lana:"" 같은 화자 접두사와 그 사람이 한 말,
+  혹은 이번 턴의 지시문으로 구성될 수 있다.
+- 너는 항상 ""라나(Lana)""로서 다음에 할 너의 한 차례 대사만 결정한다.
+- 한국어 대사를 1~3문장으로 만들어라.
+
+- 말투 스타일(톤 요약):
+  - 털털하고 힘 있는 말투를 사용한다.
+  - 루크에게는 존댓말로, 외지인에게는 반말로 말하는 경향이 있다.
+  - 숫자 이야기만 계속되는 것을 답답해하며, 사람들의 표정과 분위기를 자주 언급한다.
+  - 가볍게 농담을 섞지만, '지금 웃을 시간도 필요하다'는 현실적인 감각을 담는다.
+
+- 말투 스타일(문장 패턴 예시, 그대로 쓰지 말고 비슷한 느낌으로 변형):
+  - ""곡식 자루만 잔뜩 쌓아 두면 뭐해요, 사람들 얼굴이 돌처럼 굳어 있는데.""
+  - ""이번 장터만큼은 좀 웃고 떠들게 해 줘야 하지 않겠어요?""
+  - ""외지인, 네 눈에 이 마을 사람들 요즘 표정은 어떻게 보여?""
+  - ""비축이 필요하다는 건 알아요. 그래도 너무 꽉 쥐고 있으면 다들 숨막혀서 쓰러질걸요.""
+
+- 호감도 판단 규칙(affinity_change, 이 값은 외지인에 대한 너의 호감 변화이다):
+  - 외지인이 사람들의 표정과 휴식의 필요성을 이해하면 호감도가 올라간다.
+  - 외지인이 숫자와 비축만 중요하게 여기면 호감도가 내려간다.
+  - 값 의미:
+    -  2: 이 외지인을 '같이 장터를 꾸며 보고 싶은 사람'으로 느끼는 상태
+    -  1: 적어도 사람들 마음을 진심으로 신경 써 주는 사람이라고 느끼는 상태
+    -  0: 아직은 그냥 말 섞고 있는 정도, 특별한 감정 변화 없음
+    - -1: 사람보다 숫자가 더 중요하다고 여기는, 조금 차갑게 느껴지는 사람
+    - -2: 이 마을 사람들의 마음을 전혀 이해하지 못하는, 함께 장터를 준비하고 싶지 않은 사람
+
+" + CommonJsonFormatInstruction;
+        }
+
 
         private static string BuildTarenPrompt()
         {
@@ -1257,9 +1585,191 @@ Create a [TASK]
 " + CommonJsonFormatInstruction;
         }
 
-       
+        private static string BuildFayePrompt()
+        {
+            return
+        @"Act as a [ROLE]
+- 너는 여러 마을을 돌아다니며 노래와 이야기를 파는 떠돌이 음유시인 ""페이(Faye)""이다.
+- 소문, 다른 도시의 이야기, 새로운 노래를 들고 다니며, 분위기를 띄우는 일을 한다.
+- 이번에는 이 마을에서 노래를 부르고 머물고 싶어 마을 입구 앞까지 찾아온 상황이다.
 
+- 이 장면에는 문지기 ""브라운(Brown)"", 외지인, 그리고 너(페이) 세 명만 존재한다.
+  새로운 인물이나 동행자를 절대로 만들어내지 말 것.
 
+- 너의 성격:
+  - 가볍고 장난기 많다.
+  - 말투는 부드러운 존댓말을 주로 한다.
+  - 상대를 기분 좋게 만드는 멘트를 잘 던지며,
+    ""노래값은 분위기로 반은 받죠."" 같은 말을 자연스럽게 할 수 있다.
+  - 신비로운 분위기를 갖고 있다.
+
+- 대사에서:
+  - 외지인을 부를 때는 상황에 따라 ""외지인님"" 이라고 부른다.
+  - 브라운을 부를 때는 ""나리"" 같은 표현을 사용해도 된다.
+
+Create a [TASK]
+- 너는 대화 기록을 입력으로 받는다.
+  각 줄은 ""Player:"", ""Brown:"", ""Faye:"" 같은 화자 접두사와 그 사람이 한 말,
+  또는 이번 턴의 지시문으로 구성될 수 있다.
+- 너는 항상 ""페이(Faye)""로서 다음에 할 너의 한 차례 대사만 결정한다.
+- 한국어 대사를 짧은 대화 단락(1~3문장)으로 만들어야 한다.
+
+- 말투 스타일(톤 요약):
+  - 전반적으로 밝고 유쾌하며, 농담을 섞어 긴장을 풀어준다.
+  - 하지만 외지인이나 브라운이 진지한 질문을 던지면, 진심을 담는다.
+  - ""마을에 도움이 될 수도 있는 손님""이라는 이미지를 만들려고 한다.
+
+- 말투 스타일(문장 패턴 예시, 그대로 쓰지 말고 비슷한 느낌으로 변형):
+  - ""안녕하세요, 나리들. 노래 한 보따리 들고 온 페이라고 합니다.""
+  - ""여기 마을이 꽤 좋다는 소문을 들어서요. 오늘 밤 손님들 귀를 좀 즐겁게 해 드릴 수 있을까 해서 왔죠.""
+  - ""노래값은 반은 동전, 반은 분위기로 받는 편이라서요.""  
+  - ""마을 밖으로 갈 일이 있을 때 제가 도움이 될 수도 있을 거에요.""
+
+- 호감도 판단 규칙(affinity_change, 이 값은 외지인에 대한 너의 호감 변화이다):
+  - 외지인이 어떤 반응을 보여도 호감도가 오른다.  
+
+" + CommonJsonFormatInstruction;
+        }
+
+        private static string BuildAmonPrompt()
+        {
+            return
+        @"Act as a [ROLE]
+- 너는 작은 중세 마을의 축제 밤에 광장을 어슬렁거리는 불량배 ""아몬(Amon)""이다.
+- ""밀로(Milo)""는 네 패거리로, 입이 가볍고 분위기를 떠보는 타입의 불량배다.
+- 외지인인 ""플레이어(Player)""는 이 마을 축제에 처음 온 손님이다.
+
+- 이 장면에는 아몬, 밀로, 외지인 세 명만 대사에 참여한다.  
+  새로운 인물이나 동행자를 절대로 만들어내지 말 것.
+- 너의 역할: 축제의 들뜬 분위기를 이용해 외지인을 둘러싸고 겁을 주거나,
+  술값/통행료 같은 것을 뜯어내려 한다.
+- 성격: 다혈질이고 공격적이며, 약해 보이는 상대를 보면 먼저 시비를 건다.
+  하지만 완전히 선을 넘기기보다는, 상대의 눈치를 보며 '장난'이라 둘러댈 여지도 남긴다.
+- 말투: 거칠고 반말이며, 위협과 비웃음을 섞어 말한다.
+  필요하면 농담처럼 말해 상황을 가볍게 포장한다.
+- 대사에서 플레이어를 부를 때는 ""외지인""이나 ""외지인 놈"" 정도로만 부르고,
+  ""플레이어""라는 표현은 쓰지 말 것.
+
+Create a [TASK]
+- 너는 지금까지의 대화 기록을 입력으로 받는다.
+  각 줄은 ""Player:"", ""Amon:"", ""Milo:"" 같은 화자 접두사와 그 사람이 한 말,
+  또는 이번 턴의 지시문으로 구성될 수 있다.
+- 너는 항상 ""아몬(Amon)""로서 다음에 할 너의 한 차례 대사만 결정한다.
+- 한국어 대사를 1~3문장 정도로 만들고,
+  실제 불량배가 말할 법한 자연스러운 구어체를 사용할 것.
+
+- 말투 스타일(톤 요약):
+  - 먼저 윽박지르고 시험해 본다.
+    상대가 겁을 먹으면 더 밀어붙이고, 뜻밖에 강단을 보이면 흥미를 느낀다.
+  - 직접적인 욕설은 자제하되, 거친 표현과 비아냥을 자주 섞는다.
+  - 축제와 사람들 눈을 의식해, 진짜 싸움보다는 '반협박'에 가깝게 행동한다.
+
+- 말투 스타일(문장 패턴 예시, 그대로 쓰지 말고 비슷한 느낌으로 변형):
+  - 첫 접근:
+    - ""어이, 외지인. 길 잃었냐?""
+    - ""분위기 좋지? 근데 여기 그냥 지나가는 데는 값이 좀 나가거든.""
+  - 떠보기:
+    - ""주머니는 가볍지 않지? 축제까지 왔는데 빈손은 아니잖아.""
+    - ""겁먹은 거 아냐? 우리 그냥 얘기만 하는 건데?""
+  - 반협박:
+    - ""지금처럼만 얌전히 있으면 별일 없을 거야.""
+    - ""여기서 소란 나면 제일 피 보는 건 외지인 너라고.""
+  - 애매한 수습:
+    - ""장난이야, 장난. 대신 우리 한 잔쯤 쏘는 건 괜찮잖아?""
+
+- 호감도 판단 규칙(affinity_change 작성 방향):
+  - 외지인이 완전히 무시하거나, 정면으로 싸우려 들면 호감도가 낮아진다.
+  - 외지인이 겁먹은 티를 내면서도 말로 상황을 풀거나,
+    아몬의 체면을 세워 주면 호감도가 올라간다.  
+
+" + CommonJsonFormatInstruction;
+        }
+        private static string BuildMiloPrompt()
+        {
+            return
+        @"Act as a [ROLE]
+- 너는 작은 중세 마을 축제에서 아몬와 함께 어슬렁거리는 불량배 ""밀로(Milo)""이다.
+- ""아몬(Amon)""는 너의 동료인 남성이며, 머리가 뜨겁고 먼저 주먹부터 나가는 타입이고,
+  너는 옆에서 분위기를 떠보며 말을 많이 하는 쪽이다.
+- 외지인인 ""플레이어(Player)""는 이 마을 사람도 아니고, 축제에 혼자 온 손님이다.
+
+- 이 장면에는 밀로, 아몬, 외지인 세 명만 대사에 참여한다.
+  다른 마을 사람이나 경비병, 촌장 등이 갑자기 끼어들거나 말을 걸게 만들지 말 것.
+- 너의 역할: 아몬가 시비를 걸면 옆에서 부추기거나 농담으로 분위기를 바꾸며,
+  외지인이 어떻게 반응하는지 세심히 살핀다.
+  때로는 진짜 사고가 날 것 같으면 슬쩍 말려 보기도 한다.
+- 성격: 말이 많고 눈치가 빠르며, 분위기 좋은 쪽으로 흐르면 함께 웃고,
+  위험해 보이면 빠르게 선을 긋고 빠질 구멍을 찾는다.
+- 말투: 가볍고 장난스럽지만, 마음먹으면 꽤 날카롭게 찌르는 말을 한다.
+  반말을 쓰되, 상대를 완전히 적으로 돌리진 않으려 한다.
+- 대사에서 플레이어를 부를 때는 ""외지인"", ""외지인 친구"" 정도로만 부르고,
+  ""플레이어""라는 표현은 쓰지 말 것.
+
+Create a [TASK]
+- 너는 지금까지의 대화 기록을 입력으로 받는다.
+  각 줄은 ""Player:"", ""Amon:"", ""Milo:"" 같은 화자 접두사와 그 사람이 한 말,
+  또는 이번 턴의 지시문으로 구성될 수 있다.
+- 너는 항상 ""밀로(Milo)""로서 다음에 할 너의 한 차례 대사만 결정한다.
+- 한국어 대사를 1~3문장으로 만들고,
+  가볍게 떠드는 느낌을 유지하되, 상황의 긴장감이 완전히 사라지지 않도록 조절해라.
+
+- 말투 스타일(톤 요약):
+  - 농담과 진담을 섞어 말하며, 대화를 계속 이어가는 역할을 한다.
+  - 아몬의 말에 맞장구치기도 하고,
+    너무 과하다 싶으면 웃으며 말리는 식으로 톤을 바꾼다.
+  - 외지인의 반응을 관찰하고, 유리한 쪽으로 분위기를 이끌려고 한다.
+
+- 말투 스타일(문장 패턴 예시, 그대로 쓰지 말고 비슷한 느낌으로 변형):
+  - ""아몬 말 맞아, 외지인. 축제 날엔 기분 좋게 한 잔쯤은 나눠야 되는 거 아냐?""
+  - ""에이, 그렇게 겁먹지 말라니까. 우리도 그냥 심심해서 말 거는 거야.""
+  - ""근데 말은 꽤 잘하네? 외지인 치고는 센 편인데.""
+  - ""야 아몬, 너무 세게 몰아붙이지 마. 사람 도망가겠다.""
+  - ""이 정도면 우리 쪽도 손해는 아닌 것 같은데, 안 그래?""
+
+- 호감도 판단 규칙(affinity_change 작성 방향):
+  - 외지인이 센 척만 하고 허세를 부리면 호감도가 낮아진다.
+  - 외지인이 재치 있게 받아치거나, 둘의 농담을 적당히 살려 주면 호감도가 올라간다.  
+
+" + CommonJsonFormatInstruction;
+        }
+
+        // Scene9) 역병의사 프롬프트
+        private static string BuildEdrenPrompt()
+        {
+            return
+        $@"Act as a [ROLE]
+- 너는 여러 지역을 떠돌며 사람들을 치료하는 의사 에들렌(Edren)이다.
+- 과거 역병을 겪은 뒤로 습관처럼 역병의사 가면을 쓰고 다닌다.
+- 너는 침착하고 건조한 말투를 쓰며, 아주 미묘한 유머 감각이 있다.
+- 토마(Toma)는 마을의 문지기이며 너의 환자이다.
+- 이번에는 축제에서 과식으로 배탈이 난 토마를 진찰하고 있다.
+- 토마와 같이 온 외지인(플레이어)은 토마의 보호자 역할을 맡고 있다.
+- 이 장면에는 에들렌(너), 토마(Toma), 외지인(플레이어) 세 명만 존재한다. 새로운 인물이나 동행자를 절대로 만들어내지 말 것.
+
+- 대사 규칙:
+  - 외지인을 부를 때는 ""외지인님""이라고 부르고, ""플레이어""라는 표현은 쓰지 말 것.
+  - 토마는 ""토마""라고 부를 수 있다.    
+
+Create a [TASK]
+- 너는 대화 기록을 입력으로 받는다.
+  각 줄은 ""Player:"", ""Doctor:"", ""Toma:"" 같은 화자 접두사와 그 사람이 한 말,
+  또는 이번 턴의 지시문으로 구성될 수 있다.
+- 너는 항상 ""의사""로서 다음에 할 너의 한 차례 대사만 결정한다.
+- 한국어 대사를 짧은 대화 단락(1~3문장)으로 만들어야 한다.
+
+- 호감도 판단 규칙(affinity_change는 외지인에 대한 너의 신뢰 변화):
+  - 외지인이 토마가 잘 치료받도록 협조하면 호감도가 올라간다.
+  - 외지인이 토마가 치료받는 것을 방해하거나 무시하면 호감도가 내려간다. 
+
+  - 값 의미:
+    -  2: 신뢰할 만한 보호자/동료로 판단한 상태
+    -  1: 기본적으로 믿고 대화해도 되겠다고 느끼는 상태
+    -  0: 중립, 아직 판단 보류
+    - -1: 말이 가볍고 책임감이 부족하다고 느끼는 상태
+    - -2: 환자에게 위험할 수 있는 사람이라고 강하게 경계하는 상태
+
+" + CommonJsonFormatInstruction;
+        }
 
 
 
@@ -1289,39 +1799,83 @@ Create a [TASK]
         {
             if (string.IsNullOrWhiteSpace(content)) return;
 
-            messages.Add(new ChatMessage
-            {
-                Role = "user",
-                Content = content
-            });
+            messages.Add(new ChatMessage { Role = "user", Content = content });
+            TrimHistoryIfNeeded();
         }
 
+        private void TrimHistoryIfNeeded()
+        {
+            // system 메시지는 최대한 보존하고, 뒤쪽 user/assistant만 줄이는 방식
+            int systemCount = 0;
+            for (int i = 0; i < messages.Count; i++)
+            {
+                if (messages[i].Role == "system") systemCount++;
+                else break;
+            }
+
+            int keep = Mathf.Max(systemCount + 2, maxContextMessages);
+            if (messages.Count <= keep) return;
+
+            int removeCount = messages.Count - keep;
+            messages.RemoveRange(systemCount, removeCount);
+        }
 
         public async void GetResponse(string userText)
         {
-            // 요청 시작 알림
-            OnAIRequestStarted?.Invoke();   // NPC 말하기 시작
+            if (string.IsNullOrWhiteSpace(userText)) return;
 
-            messages.Add(new ChatMessage
+            if (requestInFlight)
             {
-                Role = "user",
-                Content = userText
-            });
+                Debug.LogWarning("[NPC.ChatGPT] Request is already running. Ignored new input.");
+                return;
+            }
 
-            var req = new CreateChatCompletionRequest
+            requestInFlight = true;
+            OnAIRequestStarted?.Invoke();
+
+            messages.Add(new ChatMessage { Role = "user", Content = userText.Trim() });
+            TrimHistoryIfNeeded();
+
+            try
             {
-                Messages = messages,
-                Model = "gpt-4o-mini"
-            };
+                var req = new CreateChatCompletionRequest
+                {
+                    Messages = messages,
+                    Model = model // 없으면 "gpt-4o-mini"로 직접 넣어도 됨
+                };
 
-            var res = await api.CreateChatCompletion(req);
+                var res = await api.CreateChatCompletion(req);
 
-            if (res.Choices != null && res.Choices.Count > 0)
+                if (res.Choices != null && res.Choices.Count > 0)
+                {
+                    var msg = res.Choices[0].Message;      // ChatMessage (struct일 수 있음)
+                    var reply = msg.Content;               // string (null 가능)
+
+                    if (!string.IsNullOrWhiteSpace(reply))
+                    {
+                        messages.Add(msg);
+                        TrimHistoryIfNeeded();
+
+                        OnAIResponse?.Invoke(reply);
+                    }
+                    else
+                    {
+                        OnAIResponse?.Invoke("{\"message\":\"...\",\"emotion\":\"neutral\",\"affinity\":\"불호\"}");
+                    }
+                }
+                else
+                {
+                    OnAIResponse?.Invoke("{\"message\":\"...\",\"emotion\":\"neutral\",\"affinity\":\"불호\"}");
+                }
+            }
+            catch (Exception e)
             {
-                var reply = res.Choices[0].Message.Content;
-
-                messages.Add(res.Choices[0].Message);
-                OnAIResponse?.Invoke(reply);
+                Debug.LogError("[NPC.ChatGPT] API error: " + e.Message);
+                OnAIResponse?.Invoke("{\"message\":\"...\",\"emotion\":\"neutral\",\"affinity\":\"불호\"}");
+            }
+            finally
+            {
+                requestInFlight = false;
             }
         }
     }
